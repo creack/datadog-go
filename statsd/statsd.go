@@ -26,6 +26,7 @@ package statsd
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"strconv"
@@ -37,7 +38,7 @@ import (
 // A Client is a handle for sending udp messages to dogstatsd.  It is safe to
 // use one Client from multiple goroutines simultaneously.
 type Client struct {
-	conn net.Conn
+	conn io.WriteCloser
 	// Namespace to prepend to all statsd calls
 	Namespace string
 	// Tags are global tags to be added to every statsd call
