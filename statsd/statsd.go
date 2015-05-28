@@ -24,8 +24,7 @@ statsd is based on go-statsd-client.
 package statsd
 
 import (
-	"bytes"
-	"fmt"
+	"errors"
 	"io"
 	"math/rand"
 	"net"
@@ -35,20 +34,25 @@ import (
 	"time"
 )
 
+// Common errors.
+var (
+	ErrClientNotInitialized = errors.New("the client is not initialized")
+	ErrMissingEventTitle    = errors.New("statsd.Event title is required")
+	ErrMissingEventText     = errors.New("statsd.Event text is required")
+)
+
 // A Client is a handle for sending udp messages to dogstatsd.  It is safe to
 // use one Client from multiple goroutines simultaneously.
 type Client struct {
-	conn io.WriteCloser
-	// Namespace to prepend to all statsd calls
-	Namespace string
-	// Tags are global tags to be added to every statsd call
-	Tags []string
-	// BufferLength is the length of the buffer in commands.
-	bufferLength int
+	sync.RWMutex
+
+	conn         io.WriteCloser
+	Namespace    string   // Namespace to prepend to all statsd calls
+	Tags         []string // Tags are global tags to be added to every statsd call
+	bufferLength int      // bufferLength is the length of the buffer in commands.
 	flushTime    time.Duration
 	commands     []string
-	stop         bool
-	sync.Mutex
+	stopChan     chan struct{}
 }
 
 // New returns a pointer to a new Client given an addr in the format "hostname:port".
@@ -57,7 +61,10 @@ func New(addr string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client := &Client{conn: conn}
+	client := &Client{
+		conn:     conn,
+		stopChan: make(chan struct{}),
+	}
 	return client, nil
 }
 
@@ -70,7 +77,7 @@ func NewBuffered(addr string, buflen int) (*Client, error) {
 	}
 	client.bufferLength = buflen
 	client.commands = make([]string, 0, buflen)
-	client.flushTime = time.Millisecond * 100
+	client.flushTime = 100 * time.Millisecond
 	go client.watch()
 	return client, nil
 }
@@ -78,45 +85,39 @@ func NewBuffered(addr string, buflen int) (*Client, error) {
 // format a message from its name, value, tags and rate.  Also adds global
 // namespace and tags.
 func (c *Client) format(name, value string, tags []string, rate float64) string {
-	var buf bytes.Buffer
+	var buf string
 	if c.Namespace != "" {
-		buf.WriteString(c.Namespace)
+		buf = c.Namespace
 	}
-	buf.WriteString(name)
-	buf.WriteString(":")
-	buf.WriteString(value)
+	buf += name + ":" + value
 	if rate < 1 {
-		buf.WriteString(`|@`)
-		buf.WriteString(strconv.FormatFloat(rate, 'f', -1, 64))
+		buf += "|@" + strconv.FormatFloat(rate, 'f', -1, 64)
 	}
-
-	tags = append(c.Tags, tags...)
-	if len(tags) > 0 {
-		buf.WriteString("|#")
-		buf.WriteString(tags[0])
-		for _, tag := range tags[1:] {
-			buf.WriteString(",")
-			buf.WriteString(tag)
-		}
+	if len(c.Tags)+len(tags) > 0 {
+		buf += "|#" + strings.Join(append(c.Tags, tags...), ",")
 	}
-	return buf.String()
+	return buf
 }
 
 func (c *Client) watch() {
-	for _ = range time.Tick(c.flushTime) {
-		if c.stop {
+	ticker := time.NewTicker(c.flushTime)
+	for {
+		select {
+		case <-c.stopChan:
+			ticker.Stop()
 			return
+		case <-ticker.C:
+			c.Lock()
+			if len(c.commands) > 0 {
+				// FIXME: eating error here
+				c.flush()
+			}
+			c.Unlock()
 		}
-		c.Lock()
-		if len(c.commands) > 0 {
-			// FIXME: eating error here
-			c.flush()
-		}
-		c.Unlock()
 	}
 }
 
-func (c *Client) append(cmd string) error {
+func (c *Client) aggregate(cmd string) error {
 	c.Lock()
 	c.commands = append(c.commands, cmd)
 	// if we should flush, lets do it
@@ -134,56 +135,48 @@ func (c *Client) append(cmd string) error {
 func (c *Client) flush() error {
 	data := strings.Join(c.commands, "\n")
 	_, err := c.conn.Write([]byte(data))
-	// clear the slice with a slice op, doesn't realloc
-	c.commands = c.commands[:0]
+	c.commands = make([]string, 0, c.bufferLength)
 	return err
 }
 
 func (c *Client) sendMsg(msg string) error {
 	// if this client is buffered, then we'll just append this
 	if c.bufferLength > 0 {
-		return c.append(msg)
+		return c.aggregate(msg)
 	}
-	c.Lock()
 	_, err := c.conn.Write([]byte(msg))
-	c.Unlock()
 	return err
 }
 
 // send handles sampling and sends the message over UDP. It also adds global namespace prefixes and tags.
 func (c *Client) send(name, value string, tags []string, rate float64) error {
 	if c == nil {
-		return nil
+		return ErrClientNotInitialized
 	}
 	if rate < 1 && rand.Float64() > rate {
 		return nil
 	}
-	data := c.format(name, value, tags, rate)
-	return c.sendMsg(data)
+	return c.sendMsg(c.format(name, value, tags, rate))
 }
 
 // Gauge measures the value of a metric at a particular time.
 func (c *Client) Gauge(name string, value float64, tags []string, rate float64) error {
-	stat := fmt.Sprintf("%f|g", value)
-	return c.send(name, stat, tags, rate)
+	return c.send(name, strconv.FormatFloat(value, 'f', 3, 64)+"|g", tags, rate)
 }
 
 // Count tracks how many times something happened per second.
 func (c *Client) Count(name string, value int64, tags []string, rate float64) error {
-	stat := fmt.Sprintf("%d|c", value)
-	return c.send(name, stat, tags, rate)
+	return c.send(name, strconv.FormatInt(value, 10)+"|c", tags, rate)
 }
 
 // Histogram tracks the statistical distribution of a set of values.
 func (c *Client) Histogram(name string, value float64, tags []string, rate float64) error {
-	stat := fmt.Sprintf("%f|h", value)
-	return c.send(name, stat, tags, rate)
+	return c.send(name, strconv.FormatFloat(value, 'f', 3, 64)+"|h", tags, rate)
 }
 
 // Set counts the number of unique elements in a group.
-func (c *Client) Set(name string, value string, tags []string, rate float64) error {
-	stat := fmt.Sprintf("%s|s", value)
-	return c.send(name, stat, tags, rate)
+func (c *Client) Set(name, value string, tags []string, rate float64) error {
+	return c.send(name, value+"|s", tags, rate)
 }
 
 // Event sends the provided Event.
@@ -197,16 +190,15 @@ func (c *Client) Event(e *Event) error {
 
 // SimpleEvent sends an event with the provided title and text.
 func (c *Client) SimpleEvent(title, text string) error {
-	e := NewEvent(title, text)
-	return c.Event(e)
+	return c.Event(NewEvent(title, text))
 }
 
 // Close the client connection.
 func (c *Client) Close() error {
 	if c == nil {
-		return nil
+		return ErrClientNotInitialized
 	}
-	c.stop = true
+	close(c.stopChan)
 	return c.conn.Close()
 }
 
@@ -214,48 +206,33 @@ func (c *Client) Close() error {
 
 type eventAlertType string
 
+// Event type enum
 const (
-	// Info is the "info" AlertType for events
-	Info eventAlertType = "info"
-	// Error is the "error" AlertType for events
-	Error eventAlertType = "error"
-	// Warning is the "warning" AlertType for events
-	Warning eventAlertType = "warning"
-	// Success is the "success" AlertType for events
-	Success eventAlertType = "success"
+	Info    eventAlertType = "info"    // Info is the "info" AlertType for events
+	Error   eventAlertType = "error"   // Error is the "error" AlertType for events
+	Warning eventAlertType = "warning" // Warning is the "warning" AlertType for events
+	Success eventAlertType = "success" // Success is the "success" AlertType for events
 )
 
 type eventPriority string
 
+// Event priority enum
 const (
-	// Normal is the "normal" Priority for events
-	Normal eventPriority = "normal"
-	// Low is the "low" Priority for events
-	Low eventPriority = "low"
+	Normal eventPriority = "normal" // Normal is the "normal" Priority for events
+	Low    eventPriority = "low"    // Low is the "low" Priority for events
 )
 
 // An Event is an object that can be posted to your DataDog event stream.
 type Event struct {
-	// Title of the event.  Required.
-	Title string
-	// Text is the description of the event.  Required.
-	Text string
-	// Timestamp is a timestamp for the event.  If not provided, the dogstatsd
-	// server will set this to the current time.
-	Timestamp time.Time
-	// Hostname for the event.
-	Hostname string
-	// AggregationKey groups this event with others of the same key.
-	AggregationKey string
-	// Priority of the event.  Can be statsd.Low or statsd.Normal.
-	Priority eventPriority
-	// SourceTypeName is a source type for the event.
-	SourceTypeName string
-	// AlertType can be statsd.Info, statsd.Error, statsd.Warning, or statsd.Success.
-	// If absent, the default value applied by the dogstatsd server is Info.
-	AlertType eventAlertType
-	// Tags for the event.
-	Tags []string
+	Title          string         // Title of the event.  Required.
+	Text           string         // Text is the description of the event.  Required.
+	Timestamp      time.Time      // Timestamp is a timestamp for the event.  If not provided, the dogstatsd server will set this to the current time.
+	Hostname       string         // Hostname for the event.
+	AggregationKey string         // AggregationKey groups this event with others of the same key.
+	Priority       eventPriority  // Priority of the event.  Can be statsd.Low or statsd.Normal.
+	SourceTypeName string         // SourceTypeName is a source type for the event.
+	AlertType      eventAlertType // AlertType can be statsd.Info, statsd.Error, statsd.Warning, or statsd.Success. If absent, the default value applied by the dogstatsd server is Info.
+	Tags           []string       // Tags for the event.
 }
 
 // NewEvent creates a new event with the given title and text.  Error checking
@@ -270,10 +247,10 @@ func NewEvent(title, text string) *Event {
 // Check verifies that an event is valid.
 func (e Event) Check() error {
 	if len(e.Title) == 0 {
-		return fmt.Errorf("statsd.Event title is required")
+		return ErrMissingEventTitle
 	}
 	if len(e.Text) == 0 {
-		return fmt.Errorf("statsd.Event text is required")
+		return ErrMissingEventText
 	}
 	return nil
 }
@@ -282,62 +259,38 @@ func (e Event) Check() error {
 // Tags may be passed which will be added to the encoded output but not to
 // the Event's list of tags, eg. for default tags.
 func (e Event) Encode(tags ...string) (string, error) {
-	err := e.Check()
-	if err != nil {
+	if err := e.Check(); err != nil {
 		return "", err
 	}
-	var buffer bytes.Buffer
-	buffer.WriteString("_e{")
-	buffer.WriteString(strconv.FormatInt(int64(len(e.Title)), 10))
-	buffer.WriteRune(',')
-	buffer.WriteString(strconv.FormatInt(int64(len(e.Text)), 10))
-	buffer.WriteString("}:")
-	buffer.WriteString(e.Title)
-	buffer.WriteRune('|')
-	buffer.WriteString(e.Text)
+	buf := "_e{" + strconv.FormatInt(int64(len(e.Title)), 10) + "," + strconv.FormatInt(int64(len(e.Text)), 10) + "}:" + e.Title + "|" + e.Text
 
 	if !e.Timestamp.IsZero() {
-		buffer.WriteString("|d:")
-		buffer.WriteString(strconv.FormatInt(int64(e.Timestamp.Unix()), 10))
+		buf += "|d:" + strconv.FormatInt(int64(e.Timestamp.Unix()), 10)
 	}
 
 	if len(e.Hostname) != 0 {
-		buffer.WriteString("|h:")
-		buffer.WriteString(e.Hostname)
+		buf += "|h:" + e.Hostname
 	}
 
 	if len(e.AggregationKey) != 0 {
-		buffer.WriteString("|k:")
-		buffer.WriteString(e.AggregationKey)
+		buf += "|k:" + e.AggregationKey
 
 	}
 
 	if len(e.Priority) != 0 {
-		buffer.WriteString("|p:")
-		buffer.WriteString(string(e.Priority))
+		buf += "|p:" + string(e.Priority)
 	}
 
 	if len(e.SourceTypeName) != 0 {
-		buffer.WriteString("|s:")
-		buffer.WriteString(e.SourceTypeName)
+		buf += "|s:" + e.SourceTypeName
 	}
 
 	if len(e.AlertType) != 0 {
-		buffer.WriteString("|t:")
-		buffer.WriteString(string(e.AlertType))
+		buf += "|t:" + string(e.AlertType)
 	}
 
 	if len(tags)+len(e.Tags) > 0 {
-		all := make([]string, 0, len(tags)+len(e.Tags))
-		all = append(all, tags...)
-		all = append(all, e.Tags...)
-		buffer.WriteString("|#")
-		buffer.WriteString(all[0])
-		for _, tag := range all[1:] {
-			buffer.WriteString(",")
-			buffer.WriteString(tag)
-		}
+		buf += "|#" + strings.Join(append(tags, e.Tags...), ",")
 	}
-
-	return buffer.String(), nil
+	return buf, nil
 }

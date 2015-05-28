@@ -63,7 +63,7 @@ func BenchmarkSend(b *testing.B) {
 
 func BenchmarkBufferedClient(b *testing.B) {
 	c := NewNopClient()
-	c.bufferLength = 100
+	c.bufferLength = 10000
 	c.commands = make([]string, 0, c.bufferLength)
 	c.flushTime = time.Millisecond * 100
 	go c.watch()
